@@ -1,0 +1,268 @@
+# vim: set ft=perl
+#
+use Rex -base;
+use Rex::Commands::File;
+use Rex::Commands::Fs;
+use Rex::Commands::Service;
+
+use YAML qw(LoadFile);
+
+set 'credentials' => "$ENV{HOME}/.config/bar/foo.credentials.yaml";
+
+user _prompt('user', 'Remote Username: ', 0);
+password _prompt('pass', 'Remote Password: ', 1);
+sudo_password _prompt('sudo', 'Sudo Password: ', 1);
+
+sudo TRUE;
+pass_auth;
+
+set 'bitbucket_user' => _prompt('bb_user', 'BitBucket User: ', 0);
+set 'bitbucket_pass' => _prompt('bb_pass', 'BitBucket Pass: ', 1);
+
+# XXX - development is the default environment
+set 'sqitch_target'   => 'foo_dev';
+set 'sqitch_password' => _prompt('sqitch_pass', 'SQITCH Password: ', 1);
+set 'umask'           => '0022';
+set 'download_url'    => 'https://bitbucket.org/bar/foo/get/master.tar.bz2';
+
+set 'base_dir'     => $ENV{PWD};
+set 'local_lib'    => "$ENV{PWD}/../local";
+set 'asset_dir'    => "$ENV{PWD}/../assets";
+set 'releases_dir' => "$ENV{PWD}/../releases";
+set 'release'      => time(); # TODO - possibly use the git sha1 instead of time
+set 'current_lnk'  => "$ENV{PWD}/../current";
+set 'tmp_dir'      => '/tmp/foo';
+set 'log_dir'      => "$ENV{PWD}/../logs";
+
+# XXX - where are we deploying? (likely needs to change based on env)
+group 'servers' => $ENV{FOO_PROD_HOST} // 'localhost';
+
+environment 'test' => sub {
+  my $base_dir = '/tmp/foo';
+
+  set 'sqitch_target' => 'foo_test';
+
+  set 'base_dir'     => $base_dir;
+  set 'local_lib'    => "$base_dir/local";
+  set 'asset_dir'    => "$base_dir/assets";
+  set 'current_lnk'  => "$base_dir/current";
+  set 'releases_dir' => "$base_dir/releases";
+  set 'tmp_dir'      => "$base_dir/tmp";
+  set 'log_dir'      => "$base_dir/logs";
+};
+
+environment 'prod' => sub {
+  my $base_dir = '/srv/foo';
+
+  set 'umask'         => '0002';
+  set 'sqitch_target' => 'foo_prod';
+
+  set 'base_dir'     => $base_dir;
+  set 'local_lib'    => "$base_dir/local";
+  set 'asset_dir'    => "$base_dir/assets";
+  set 'current_lnk'  => "$base_dir/current";
+  set 'releases_dir' => "$base_dir/releases";
+  set 'tmp_dir'      => "$base_dir/tmp";
+  set 'log_dir'      => "$base_dir/logs";
+};
+
+task 'prereqs', group => 'servers' => sub {
+  pkg [qw(
+    build-essential
+    curl
+    git
+    libxml2
+    libxml2-dev
+    libexpat1-dev
+    libgraphics-magick-perl
+    libmysqlclient-dev
+    perlmagick
+    nginx
+  )], ensure => 'present';
+};
+
+task 'setup', group => 'servers' => sub {
+  my $base_dir     = get 'base_dir';
+  my $asset_dir    = get 'asset_dir';
+  my $local_lib    = get 'local_lib';
+  my $releases_dir = get 'releases_dir';
+  my $tmp_dir      = get 'tmp_dir';
+  my $log_dir      = get 'log_dir';
+
+  mkdir($base_dir),        unless => "test -d $base_dir";
+  mkdir($local_lib),       unless => "test -d $local_lib";
+  mkdir($asset_dir),       unless => "test -d $asset_dir";
+  mkdir($releases_dir),    unless => "test -d $releases_dir";
+  mkdir("$local_lib/bin"), unless => "test -d $local_lib/bin";
+  mkdir($tmp_dir),         unless => "test -d $tmp_dir";
+  mkdir($log_dir),         unless => "test -d $log_dir";
+};
+
+task 'get_release', group => 'servers' => sub {
+  my $download_url = get 'download_url';
+  my $releases_dir = get 'releases_dir';
+  my $release      = get 'release';
+  my $tmp_dir      = get 'tmp_dir';
+  my $bb_user      = get 'bitbucket_user';
+  my $bb_pass      = get 'bitbucket_pass';
+
+  file "$tmp_dir/master.tar.bz2", ensure => 'absent';
+
+  run "wget --quiet --user \$BB_USER --password \$BB_PASS $download_url",
+    cwd => $tmp_dir,
+    env => {
+      BB_USER => "$bb_user",
+      BB_PASS => "$bb_pass",
+    };
+
+  mkdir("$releases_dir/$release"), unless => "test -d $releases_dir/$release";
+
+  run "tar --strip-components 1 -C . -xf $tmp_dir/master.tar.bz2",
+    cwd => "$releases_dir/$release";
+};
+
+task 'setup_perl_env', group => 'servers' => sub {
+  my $local_lib = get 'local_lib';
+  my $cpanm     = "$local_lib/bin/cpanm";
+
+  run "curl -s -L https://cpanmin.us/ > $cpanm",
+    unless => "test -x $cpanm";
+
+  chmod(755, $cpanm), unless => "test -x $cpanm";
+
+  run "$cpanm --self-contained --local-lib $local_lib Carton",
+    unless => "test -e $local_lib/lib/perl5/Carton.pm";
+};
+
+task 'install_perl_deps', group => 'servers' => sub {
+  my $umask        = get 'umask';
+  my $local_lib    = get 'local_lib';
+  my $releases_dir = get 'releases_dir';
+  my $release      = get 'release';
+  my $carton       = "$local_lib/bin/carton";
+
+  my $carton_cmd = case environment, {
+    prod    => "$carton install --deployment",
+    default => "$carton install",
+  };
+
+  run "umask $umask ; $carton_cmd",
+    cwd     => "$releases_dir/$release",
+    env     => {
+      PERL5LIB         => "$local_lib/lib/perl5",
+      PERL_CARTON_PATH => "$local_lib",
+    };
+};
+
+task 'sqitch_deploy', group => 'servers' => sub {
+  my $pass         = get 'sqitch_password';
+  my $local_lib    = get 'local_lib';
+  my $target       = get 'sqitch_target';
+  my $pass         = get 'sqitch_password';
+  my $releases_dir = get 'releases_dir';
+  my $release      = get 'release';
+
+  run "$local_lib/bin/sqitch deploy $target",
+    cwd => "$releases_dir/$release/schema",
+    env => {
+      PERL5LIB        => "$local_lib/lib/perl5",
+      SQITCH_PASSWORD => $pass
+    };
+};
+
+task 'set_current_link', group => 'servers' => sub {
+  my $releases_dir = get 'releases_dir';
+  my $release      = get 'release';
+  my $current      = get 'current_lnk';
+  my $log_dir      = get 'log_dir';
+
+  rm($current), if => "test -l $current";
+  symlink("$releases_dir/$release", $current);
+
+  symlink($log_dir, "$releases_dir/$release/log");
+};
+
+task 'setup_proxy_server', group => 'servers' => sub {
+  file '/etc/nginx/sites-available/foo.conf',
+    source => 'rex/files/nginx/foo.conf',
+    owner  => 'root',
+    group  => 'root';
+
+  symlink('/etc/nginx/sites-available/foo.conf', '/etc/nginx/sites-enabled/foo.conf'),
+    unless => 'test -l /etc/nginx/sites-enabled/foo.conf';
+
+  rm('/etc/nginx/sites-enabled/default'), if => 'test -e /etc/nginx/sites-enabled/default';
+};
+
+task 'setup_app_server', group => 'servers' => sub {
+  file '/lib/systemd/system/foo.service',
+    source    => 'rex/files/systemd/foo.service',
+    owner     => 'root',
+    group     => 'root',
+    on_change => sub {
+      run "systemctl --system daemon-reload";
+      service 'foo' => 'restart';
+    };
+};
+
+task 'setup_config', group => 'servers' => sub {
+  use Data::Dumper;
+  $Data::Dumper::Terse = 1;
+
+  my $releases_dir = get 'releases_dir';
+  my $release      = get 'release';
+
+  my $config = do 'foo.conf';
+
+  $config->{paths}->{assets} = get 'asset_dir';
+  $config->{paths}->{tmp}    = get 'tmp_dir';
+
+  my $mode = case environment, {
+    prod => 'production',
+    dev  => 'development',
+    test => 'test',
+  };
+
+  file "$releases_dir/$release/foo.$mode.conf",
+    content => Data::Dumper->Dump([$config]);
+};
+
+task 'restart_app_server', group => 'servers' => sub {
+  service 'foo' => 'restart';
+};
+
+batch 'deploy', (
+  qw(
+    prereqs
+    setup
+    get_release
+    setup_perl_env
+    install_perl_deps
+    sqitch_deploy
+    setup_config
+    set_current_link
+    setup_proxy_server
+    setup_app_server
+    restart_app_server
+  )
+);
+
+sub _prompt {
+  my ($field, $prompt, $hide) = @_;
+  my $creds = get 'credentials';
+
+  if (-e $creds) {
+    my $results = LoadFile($creds);
+    return $results->{$field} if exists $results->{$field};
+  }
+
+  print $prompt;
+  run "stty -echo" if $hide;
+
+  chomp(my $input = <STDIN>);
+
+  run "stty echo" if $hide;
+  print "\n" if $hide;
+
+  return $input;
+}
