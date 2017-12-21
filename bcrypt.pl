@@ -4,24 +4,22 @@ use Modern::Perl;
 use Data::Dumper;
 
 use Data::Entropy::Algorithms qw(rand_bits);
-use Digest; # XXX - Digest::Bcrypt
+use Digest;    # XXX - Digest::Bcrypt
+use String::Random qw(random_string);
 
 use Test::More;
 
-for (1..1000) {
-  my $pass = join('', (map +(0..9,'a'..'z','A'..'Z', ' ')[rand(10+26*2)], 1..50));
-  my $hash = encrypt($pass);
+for (1 .. 1000) {
+  my $pass   = random_string("." x 100);
+  my $hash   = encrypt($pass);
+  my $digest = Digest->new('Bcrypt', settings => $hash);
 
-  my $settings = substr($hash, 0, 29);
-  my $known    = substr($hash, 29);
-  my $digest   = Digest->new('Bcrypt', settings => $settings);
+  $digest->add($pass);
 
-  # diag($pass);
-  # diag($settings);
-  # diag($known);
-  # diag($hash);
+  diag($pass);
+  diag($hash);
 
-  is($digest->add($pass)->bcrypt_b64digest, $known);
+  is($digest->settings . $digest->bcrypt_b64digest, $hash);
 }
 
 sub encrypt {
