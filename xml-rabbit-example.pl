@@ -6,6 +6,11 @@ use Data::Dumper;
 package Bookstore {
   use XML::Rabbit::Root;
   has_xpath_object_list books => './book' => 'Bookstore::Book';
+
+  sub total_books {
+    return scalar @{shift->books};
+  }
+
   finalize_class();
 };
 
@@ -22,7 +27,7 @@ package Bookstore::Book {
 };
 
 my $bookstore = Bookstore->new(file => $ARGV[0]);
-print Dumper $bookstore->books;
+print Dumper $bookstore->total_books;
 
 __DATA__
 <?xml version="1.0"?>
